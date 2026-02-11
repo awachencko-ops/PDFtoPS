@@ -82,6 +82,13 @@ namespace PDFtoPS
         private bool isConverting;
         private const int MaxParallelConversions = 2;
 
+        private sealed class FileConversionResult
+        {
+            public string FileName { get; init; } = string.Empty;
+            public bool Success { get; init; }
+            public string ErrorMessage { get; init; } = string.Empty;
+        }
+
         private Dictionary<string, string> profiles = new Dictionary<string, string>
         {
             { "Standard (PS Level 3)", "-sDEVICE=ps2write -dLanguageLevel=3" },
@@ -308,7 +315,6 @@ namespace PDFtoPS
             string psFontArgs = GetFontArgs();
             string profileArgs = profiles[comboBoxProfiles.SelectedItem.ToString()];
 
-            int successCount = 0;
             int completedCount = 0;
             string tempWorkDir = Path.Combine(Path.GetTempPath(), "PDFtoPS_Work");
             if (!Directory.Exists(tempWorkDir)) Directory.CreateDirectory(tempWorkDir);
@@ -322,7 +328,7 @@ namespace PDFtoPS
 
             try
             {
-                List<Task> tasks = files.Select(path => ProcessFileAsync(
+                List<Task<FileConversionResult>> tasks = files.Select(path => ProcessFileAsync(
                     semaphore,
                     ct,
                     gsPath,
@@ -335,28 +341,42 @@ namespace PDFtoPS
                     profileArgs,
                     sizeArgs,
                     psFontArgs,
-                    () =>
-                    {
-                        Interlocked.Increment(ref successCount);
-                    },
                     fileName => InvokeOnUi(() => this.Text = $"Конвертация: {fileName}..."),
                     () =>
                     {
                         int done = Interlocked.Increment(ref completedCount);
-                        InvokeOnUi(() =>
-                        {
-                            progressBar1.Value = Math.Min(done, progressBar1.Maximum);
-                        });
+                        InvokeOnUi(() => progressBar1.Value = Math.Min(done, progressBar1.Maximum));
                     })).ToList();
 
-                await Task.WhenAll(tasks);
+                FileConversionResult[] results = await Task.WhenAll(tasks);
 
-                MessageBox.Show($"Готово! Успешно: {successCount} из {files.Count}");
+                int successCount = results.Count(r => r.Success);
+                var failed = results.Where(r => !r.Success).ToList();
+
+                if (failed.Count == 0)
+                {
+                    MessageBox.Show($"Готово! Успешно: {successCount} из {files.Count}");
+                }
+                else
+                {
+                    string details = string.Join(Environment.NewLine, failed.Take(5).Select(r => $"- {r.FileName}: {r.ErrorMessage}"));
+                    if (failed.Count > 5)
+                    {
+                        details += Environment.NewLine + $"... и ещё {failed.Count - 5} ошибок.";
+                    }
+
+                    MessageBox.Show(
+                        $"Обработка завершена. Успешно: {successCount} из {files.Count}." + Environment.NewLine + Environment.NewLine + details,
+                        "Завершено с ошибками",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                }
+
                 if (successCount > 0) Process.Start("explorer.exe", outputDir);
             }
             catch (OperationCanceledException)
             {
-                MessageBox.Show($"Конвертация отменена. Успешно обработано: {successCount} из {files.Count}", "Отмена", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show($"Конвертация отменена. Обработано файлов: {completedCount} из {files.Count}", "Отмена", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             finally
             {
@@ -370,7 +390,7 @@ namespace PDFtoPS
             }
         }
 
-        private async Task ProcessFileAsync(
+        private async Task<FileConversionResult> ProcessFileAsync(
             SemaphoreSlim semaphore,
             CancellationToken ct,
             string gsPath,
@@ -383,7 +403,6 @@ namespace PDFtoPS
             string profileArgs,
             string sizeArgs,
             string psFontArgs,
-            Action onSuccess,
             Action<string> onStart,
             Action onCompleted)
         {
@@ -393,11 +412,7 @@ namespace PDFtoPS
             try
             {
                 onStart(fileName);
-                bool converted = await Task.Run(() => ConvertSingleFile(gsPath, inputPath, outputDir, tempWorkDir, fileName, pdfSettings, colorArgs, pdfFontArgs, profileArgs, sizeArgs, psFontArgs, ct), ct);
-                if (converted)
-                {
-                    onSuccess();
-                }
+                return await Task.Run(() => ConvertSingleFile(gsPath, inputPath, outputDir, tempWorkDir, fileName, pdfSettings, colorArgs, pdfFontArgs, profileArgs, sizeArgs, psFontArgs, ct), ct);
             }
             finally
             {
@@ -417,7 +432,7 @@ namespace PDFtoPS
             action();
         }
 
-        private bool ConvertSingleFile(string gsPath, string inputPath, string outputDir, string tempWorkDir, string fileName, string pdfSettings, string colorArgs, string pdfFontArgs, string profileArgs, string sizeArgs, string psFontArgs, CancellationToken ct)
+        private FileConversionResult ConvertSingleFile(string gsPath, string inputPath, string outputDir, string tempWorkDir, string fileName, string pdfSettings, string colorArgs, string pdfFontArgs, string profileArgs, string sizeArgs, string psFontArgs, CancellationToken ct)
         {
             string safeInput = Path.Combine(tempWorkDir, $"in_{Guid.NewGuid().ToString().Substring(0, 8)}.pdf");
             string safeNorm = Path.Combine(tempWorkDir, $"norm_{Guid.NewGuid().ToString().Substring(0, 8)}.pdf");
@@ -428,24 +443,38 @@ namespace PDFtoPS
                 ct.ThrowIfCancellationRequested();
                 File.Copy(inputPath, safeInput, true);
 
-                string pass1Args = $"-dNOPAUSE -dBATCH -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 {pdfSettings} {colorArgs} {pdfFontArgs} -sOutputFile="{safeNorm}" "{safeInput}"";
+                string pass1Args = $"-dNOPAUSE -dBATCH -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 {pdfSettings} {colorArgs} {pdfFontArgs} -sOutputFile=\"{safeNorm}\" \"{safeInput}\"";
                 GhostscriptRunResult pass1Result = ghostscriptRunner.RunWithRetry(gsPath, pass1Args, "pdfwrite-normalization", safeNorm, ct);
                 if (!pass1Result.Success)
                 {
                     if (pass1Result.ErrorCode == GhostscriptErrorCode.Cancelled) throw new OperationCanceledException(ct);
-                    throw new Exception(BuildGhostscriptUiError("Ошибка pdfwrite (Pass 1)", pass1Result));
+                    return new FileConversionResult
+                    {
+                        FileName = fileName,
+                        Success = false,
+                        ErrorMessage = BuildGhostscriptUiError("Ошибка pdfwrite (Pass 1)", pass1Result)
+                    };
                 }
 
                 ct.ThrowIfCancellationRequested();
-                string pass2Args = $"-dNOPAUSE -dBATCH {profileArgs} -r2400 {sizeArgs} {psFontArgs} -sOutputFile="{finalPsPath}" "{safeNorm}"";
+                string pass2Args = $"-dNOPAUSE -dBATCH {profileArgs} -r2400 {sizeArgs} {psFontArgs} -sOutputFile=\"{finalPsPath}\" \"{safeNorm}\"";
                 GhostscriptRunResult pass2Result = ghostscriptRunner.RunWithRetry(gsPath, pass2Args, "ps2write-generation", finalPsPath, ct);
                 if (!pass2Result.Success)
                 {
                     if (pass2Result.ErrorCode == GhostscriptErrorCode.Cancelled) throw new OperationCanceledException(ct);
-                    throw new Exception(BuildGhostscriptUiError("Ошибка ps2write (Pass 2)", pass2Result));
+                    return new FileConversionResult
+                    {
+                        FileName = fileName,
+                        Success = false,
+                        ErrorMessage = BuildGhostscriptUiError("Ошибка ps2write (Pass 2)", pass2Result)
+                    };
                 }
 
-                return true;
+                return new FileConversionResult
+                {
+                    FileName = fileName,
+                    Success = true
+                };
             }
             catch (OperationCanceledException)
             {
@@ -453,8 +482,13 @@ namespace PDFtoPS
             }
             catch (Exception ex)
             {
-                InvokeOnUi(() => MessageBox.Show($"Файл: {fileName}\n\n{ex.Message}", "Сбой", MessageBoxButtons.OK, MessageBoxIcon.Error));
-                return false;
+                logger.Error("Unhandled file conversion error", ("fileName", fileName), ("error", ex.Message));
+                return new FileConversionResult
+                {
+                    FileName = fileName,
+                    Success = false,
+                    ErrorMessage = ex.Message
+                };
             }
             finally
             {
