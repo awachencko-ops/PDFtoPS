@@ -11,6 +11,7 @@ internal enum GhostscriptErrorCode
     Timeout,
     NonZeroExitCode,
     OutputFileMissing,
+    Cancelled,
     Unknown
 }
 
@@ -52,14 +53,20 @@ internal sealed class GhostscriptRunner
         return string.Empty;
     }
 
-    public GhostscriptRunResult RunWithRetry(string gsPath, string arguments, string operation, string? expectedOutputPath = null)
+    public GhostscriptRunResult RunWithRetry(string gsPath, string arguments, string operation, string? expectedOutputPath = null, CancellationToken cancellationToken = default)
     {
         GhostscriptRunResult lastResult = new() { Success = false, ErrorCode = GhostscriptErrorCode.Unknown };
 
         for (int attempt = 1; attempt <= retryCount; attempt++)
         {
-            lastResult = Run(gsPath, arguments, operation, attempt, expectedOutputPath);
+            cancellationToken.ThrowIfCancellationRequested();
+            lastResult = Run(gsPath, arguments, operation, attempt, expectedOutputPath, cancellationToken);
             if (lastResult.Success)
+            {
+                return lastResult;
+            }
+
+            if (lastResult.ErrorCode == GhostscriptErrorCode.Cancelled)
             {
                 return lastResult;
             }
@@ -71,14 +78,14 @@ internal sealed class GhostscriptRunner
 
             if (attempt < retryCount)
             {
-                Thread.Sleep(retryDelayMs);
+                cancellationToken.WaitHandle.WaitOne(retryDelayMs);
             }
         }
 
         return lastResult;
     }
 
-    private GhostscriptRunResult Run(string gsPath, string arguments, string operation, int attempt, string? expectedOutputPath)
+    private GhostscriptRunResult Run(string gsPath, string arguments, string operation, int attempt, string? expectedOutputPath, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(gsPath) || !File.Exists(gsPath))
         {
@@ -135,18 +142,34 @@ internal sealed class GhostscriptRunner
             process.BeginOutputReadLine();
             process.BeginErrorReadLine();
 
-            if (!process.WaitForExit((int)timeout.TotalMilliseconds))
+            DateTime deadline = DateTime.UtcNow + timeout;
+            while (!process.WaitForExit(200))
             {
-                try { process.Kill(true); } catch { }
-
-                return new GhostscriptRunResult
+                if (cancellationToken.IsCancellationRequested)
                 {
-                    Success = false,
-                    ErrorCode = GhostscriptErrorCode.Timeout,
-                    Message = $"Ghostscript timed out after {timeout.TotalMinutes:0} min.",
-                    StdOut = stdOut.ToString(),
-                    StdErr = stdErr.ToString()
-                };
+                    try { process.Kill(true); } catch { }
+                    return new GhostscriptRunResult
+                    {
+                        Success = false,
+                        ErrorCode = GhostscriptErrorCode.Cancelled,
+                        Message = "Ghostscript execution cancelled by user.",
+                        StdOut = stdOut.ToString(),
+                        StdErr = stdErr.ToString()
+                    };
+                }
+
+                if (DateTime.UtcNow > deadline)
+                {
+                    try { process.Kill(true); } catch { }
+                    return new GhostscriptRunResult
+                    {
+                        Success = false,
+                        ErrorCode = GhostscriptErrorCode.Timeout,
+                        Message = $"Ghostscript timed out after {timeout.TotalMinutes:0} min.",
+                        StdOut = stdOut.ToString(),
+                        StdErr = stdErr.ToString()
+                    };
+                }
             }
 
             process.WaitForExit();

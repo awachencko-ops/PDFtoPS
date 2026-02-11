@@ -8,7 +8,9 @@ using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Windows.Forms;
+using System.Threading.Tasks;
 
 namespace PDFtoPS
 {
@@ -76,6 +78,8 @@ namespace PDFtoPS
         private SortOrder lastSortOrder = SortOrder.Ascending;
         private readonly AppLogger logger;
         private readonly GhostscriptRunner ghostscriptRunner;
+        private CancellationTokenSource conversionCts;
+        private bool isConverting;
 
         private Dictionary<string, string> profiles = new Dictionary<string, string>
         {
@@ -262,8 +266,14 @@ namespace PDFtoPS
 
         // --- КНОПКИ И СОБЫТИЯ ---
 
-        private void btnConvert_Click(object sender, EventArgs e)
+        private async void btnConvert_Click(object sender, EventArgs e)
         {
+            if (isConverting)
+            {
+                conversionCts?.Cancel();
+                return;
+            }
+
             string gsPath = ghostscriptRunner.ResolveGhostscriptPath();
             if (string.IsNullOrWhiteSpace(gsPath) || !File.Exists(gsPath))
             {
@@ -276,106 +286,116 @@ namespace PDFtoPS
             string outputDir = txtOutputPath.Text;
             if (string.IsNullOrEmpty(outputDir) || !Directory.Exists(outputDir)) { MessageBox.Show("Выберите папку!"); return; }
 
-            // --- НАСТРОЙКА ВАШЕГО PROGRESSBAR ---
+            conversionCts = new CancellationTokenSource();
+            CancellationToken ct = conversionCts.Token;
+            isConverting = true;
+            string originalButtonText = btnConvert.Text;
+            btnConvert.Text = "Отмена";
+
             progressBar1.Minimum = 0;
             progressBar1.Maximum = listViewFiles.Items.Count;
             progressBar1.Value = 0;
             progressBar1.Step = 1;
-            progressBar1.Visible = true; // Показываем бар
+            progressBar1.Visible = true;
 
-            // --- НАСТРОЙКИ КОНВЕРТАЦИИ ---
             string pdfSettings = GetPdfSettings();
             string colorArgs = "-sProcessColorModel=DeviceCMYK -sColorConversionStrategy=CMYK";
             string sizeArgs = GetPageSizeArgs();
             string pdfFontArgs = "-dEmbedAllFonts=true -dSubsetFonts=true";
             string psFontArgs = GetFontArgs();
+            string profileArgs = profiles[comboBoxProfiles.SelectedItem.ToString()];
 
             int successCount = 0;
-            string originalTitle = this.Text; // Запоминаем название программы
-
-            // Временная папка
+            string originalTitle = this.Text;
             string tempWorkDir = Path.Combine(Path.GetTempPath(), "PDFtoPS_Work");
             if (!Directory.Exists(tempWorkDir)) Directory.CreateDirectory(tempWorkDir);
 
-            foreach (ListViewItem item in listViewFiles.Items)
+            try
             {
-                string inputPath = item.Tag.ToString();
-                string fileName = Path.GetFileNameWithoutExtension(inputPath);
-
-                string safeInput = Path.Combine(tempWorkDir, $"in_{Guid.NewGuid().ToString().Substring(0, 8)}.pdf");
-                string safeNorm = Path.Combine(tempWorkDir, $"norm_{Guid.NewGuid().ToString().Substring(0, 8)}.pdf");
-                string finalPsPath = Path.Combine(outputDir, fileName + ".ps");
-
-                try
+                foreach (ListViewItem item in listViewFiles.Items)
                 {
-                    File.Copy(inputPath, safeInput, true);
+                    ct.ThrowIfCancellationRequested();
 
-                    // ШАГ 1: НОРМАЛИЗАЦИЯ
-                    // Пишем статус в заголовок окна
-                    this.Text = $"Нормализация: {fileName}...";
-                    Application.DoEvents(); // Чтобы интерфейс не завис
+                    string inputPath = item.Tag.ToString();
+                    string fileName = Path.GetFileNameWithoutExtension(inputPath);
 
-                    string pass1Args = $"-dNOPAUSE -dBATCH -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 " +
-                                       $"{pdfSettings} {colorArgs} {pdfFontArgs} " +
-                                       $"-sOutputFile=\"{safeNorm}\" \"{safeInput}\"";
-
-                    GhostscriptRunResult pass1Result = ghostscriptRunner.RunWithRetry(
-                        gsPath,
-                        pass1Args,
-                        operation: "pdfwrite-normalization",
-                        expectedOutputPath: safeNorm);
-
-                    if (!pass1Result.Success)
-                    {
-                        throw new Exception(BuildGhostscriptUiError("Ошибка pdfwrite (Pass 1)", pass1Result));
-                    }
-
-                    // ШАГ 2: ГЕНЕРАЦИЯ PS
-                    this.Text = $"Генерация PS: {fileName}...";
+                    this.Text = $"Конвертация: {fileName}...";
                     Application.DoEvents();
 
-                    string profileArgs = profiles[comboBoxProfiles.SelectedItem.ToString()];
+                    bool converted = await Task.Run(() => ConvertSingleFile(gsPath, inputPath, outputDir, tempWorkDir, fileName, pdfSettings, colorArgs, pdfFontArgs, profileArgs, sizeArgs, psFontArgs, ct), ct);
 
-                    string pass2Args = $"-dNOPAUSE -dBATCH {profileArgs} -r2400 {sizeArgs} {psFontArgs} " +
-                                       $"-sOutputFile=\"{finalPsPath}\" \"{safeNorm}\"";
-
-                    GhostscriptRunResult pass2Result = ghostscriptRunner.RunWithRetry(
-                        gsPath,
-                        pass2Args,
-                        operation: "ps2write-generation",
-                        expectedOutputPath: finalPsPath);
-
-                    if (pass2Result.Success)
+                    if (converted)
                     {
                         successCount++;
                     }
-                    else
-                    {
-                        throw new Exception(BuildGhostscriptUiError("Ошибка ps2write (Pass 2)", pass2Result));
-                    }
-                }
-                catch (Exception ex)
-                {
-                    MessageBox.Show($"Файл: {fileName}\n\n{ex.Message}", "Сбой", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                }
-                finally
-                {
-                    try { if (File.Exists(safeInput)) File.Delete(safeInput); } catch { }
-                    try { if (File.Exists(safeNorm)) File.Delete(safeNorm); } catch { }
+
+                    progressBar1.PerformStep();
                 }
 
-                // Двигаем прогресс-бар
-                progressBar1.PerformStep();
+                MessageBox.Show($"Готово! Успешно: {successCount} из {listViewFiles.Items.Count}");
+                if (successCount > 0) Process.Start("explorer.exe", outputDir);
             }
+            catch (OperationCanceledException)
+            {
+                MessageBox.Show($"Конвертация отменена. Успешно обработано: {successCount} из {listViewFiles.Items.Count}", "Отмена", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            finally
+            {
+                try { Directory.Delete(tempWorkDir, true); } catch { }
+                this.Text = originalTitle;
+                progressBar1.Value = 0;
+                btnConvert.Text = originalButtonText;
+                isConverting = false;
+                conversionCts?.Dispose();
+                conversionCts = null;
+            }
+        }
 
-            try { Directory.Delete(tempWorkDir, true); } catch { }
+        private bool ConvertSingleFile(string gsPath, string inputPath, string outputDir, string tempWorkDir, string fileName, string pdfSettings, string colorArgs, string pdfFontArgs, string profileArgs, string sizeArgs, string psFontArgs, CancellationToken ct)
+        {
+            string safeInput = Path.Combine(tempWorkDir, $"in_{Guid.NewGuid().ToString().Substring(0, 8)}.pdf");
+            string safeNorm = Path.Combine(tempWorkDir, $"norm_{Guid.NewGuid().ToString().Substring(0, 8)}.pdf");
+            string finalPsPath = Path.Combine(outputDir, fileName + ".ps");
 
-            // Возвращаем заголовок и сбрасываем бар
-            this.Text = originalTitle;
-            progressBar1.Value = 0;
+            try
+            {
+                ct.ThrowIfCancellationRequested();
+                File.Copy(inputPath, safeInput, true);
 
-            MessageBox.Show($"Готово! Успешно: {successCount} из {listViewFiles.Items.Count}");
-            if (successCount > 0) Process.Start("explorer.exe", outputDir);
+                string pass1Args = $"-dNOPAUSE -dBATCH -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 {pdfSettings} {colorArgs} {pdfFontArgs} -sOutputFile=\"{safeNorm}\" \"{safeInput}\"";
+                GhostscriptRunResult pass1Result = ghostscriptRunner.RunWithRetry(gsPath, pass1Args, "pdfwrite-normalization", safeNorm, ct);
+                if (!pass1Result.Success)
+                {
+                    if (pass1Result.ErrorCode == GhostscriptErrorCode.Cancelled) throw new OperationCanceledException(ct);
+                    throw new Exception(BuildGhostscriptUiError("Ошибка pdfwrite (Pass 1)", pass1Result));
+                }
+
+                ct.ThrowIfCancellationRequested();
+                string pass2Args = $"-dNOPAUSE -dBATCH {profileArgs} -r2400 {sizeArgs} {psFontArgs} -sOutputFile=\"{finalPsPath}\" \"{safeNorm}\"";
+                GhostscriptRunResult pass2Result = ghostscriptRunner.RunWithRetry(gsPath, pass2Args, "ps2write-generation", finalPsPath, ct);
+                if (!pass2Result.Success)
+                {
+                    if (pass2Result.ErrorCode == GhostscriptErrorCode.Cancelled) throw new OperationCanceledException(ct);
+                    throw new Exception(BuildGhostscriptUiError("Ошибка ps2write (Pass 2)", pass2Result));
+                }
+
+                return true;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                BeginInvoke(new Action(() =>
+                    MessageBox.Show($"Файл: {fileName}\n\n{ex.Message}", "Сбой", MessageBoxButtons.OK, MessageBoxIcon.Error)));
+                return false;
+            }
+            finally
+            {
+                try { if (File.Exists(safeInput)) File.Delete(safeInput); } catch { }
+                try { if (File.Exists(safeNorm)) File.Delete(safeNorm); } catch { }
+            }
         }
 
         // --- НОВЫЙ МЕТОД ДЛЯ ОПРЕДЕЛЕНИЯ ПРОФИЛЯ ---
@@ -428,6 +448,7 @@ namespace PDFtoPS
                 GhostscriptErrorCode.Timeout => "Ghostscript превысил лимит времени. Возможно, PDF повреждён или слишком тяжёлый.",
                 GhostscriptErrorCode.NonZeroExitCode => "Ghostscript завершился с ошибкой. Проверьте входной PDF и параметры профиля.",
                 GhostscriptErrorCode.OutputFileMissing => "Ghostscript завершился, но выходной файл не создан.",
+                GhostscriptErrorCode.Cancelled => "Операция отменена пользователем.",
                 _ => "Неизвестная ошибка при запуске Ghostscript."
             };
 
