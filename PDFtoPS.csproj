@@ -15,4 +15,9 @@
     </None>
   </ItemGroup>
 
+
+  <ItemGroup>
+    <Compile Remove="PDFtoPS.Tests\**\*.cs" />
+  </ItemGroup>
+
 </Project>
