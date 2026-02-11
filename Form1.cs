@@ -90,6 +90,7 @@ namespace PDFtoPS
             InitializeComponent();
             logger = new AppLogger();
             ghostscriptRunner = new GhostscriptRunner(TimeSpan.FromMinutes(5), retryCount: 2, retryDelayMs: 800, logger);
+            RunGhostscriptHealthCheck();
 
             SetWindowTheme(listViewFiles.Handle, "explorer", null);
             IntPtr hHeader = SendMessage(listViewFiles.Handle, LVM_GETHEADER, IntPtr.Zero, IntPtr.Zero);
@@ -399,6 +400,18 @@ namespace PDFtoPS
             }
         }
 
+        private void RunGhostscriptHealthCheck()
+        {
+            string gsPath = ghostscriptRunner.ResolveGhostscriptPath();
+            if (string.IsNullOrWhiteSpace(gsPath) || !File.Exists(gsPath))
+            {
+                logger.Warning("Ghostscript health-check failed", ("reason", "executable_not_found"));
+                return;
+            }
+
+            logger.Info("Ghostscript health-check passed", ("path", gsPath));
+        }
+
         private string BuildGhostscriptUiError(string title, GhostscriptRunResult result)
         {
             logger.Error(title,
@@ -408,7 +421,17 @@ namespace PDFtoPS
                 ("stderr", result.StdErr),
                 ("stdout", result.StdOut));
 
-            return $"{title}\nКод: {result.ErrorCode}\n{result.Message}";
+            string friendlyText = result.ErrorCode switch
+            {
+                GhostscriptErrorCode.ExecutableNotFound => "Не найден исполняемый файл Ghostscript. Проверьте GHOSTSCRIPT_PATH и установку Ghostscript.",
+                GhostscriptErrorCode.ProcessStartFailed => "Не удалось запустить процесс Ghostscript. Проверьте права доступа и антивирусные ограничения.",
+                GhostscriptErrorCode.Timeout => "Ghostscript превысил лимит времени. Возможно, PDF повреждён или слишком тяжёлый.",
+                GhostscriptErrorCode.NonZeroExitCode => "Ghostscript завершился с ошибкой. Проверьте входной PDF и параметры профиля.",
+                GhostscriptErrorCode.OutputFileMissing => "Ghostscript завершился, но выходной файл не создан.",
+                _ => "Неизвестная ошибка при запуске Ghostscript."
+            };
+
+            return $"{title}\nКод: {result.ErrorCode}\n{friendlyText}\nТех. сообщение: {result.Message}\nСмотрите лог в папке logs.";
         }
 
         // --- ОСТАЛЬНЫЕ МЕТОДЫ СПИСКА (без изменений) ---

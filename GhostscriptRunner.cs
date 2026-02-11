@@ -101,6 +101,7 @@ internal sealed class GhostscriptRunner
         };
 
         using Process process = new() { StartInfo = psi };
+        bool processStarted = false;
         StringBuilder stdOut = new();
         StringBuilder stdErr = new();
 
@@ -130,6 +131,7 @@ internal sealed class GhostscriptRunner
                 };
             }
 
+            processStarted = true;
             process.BeginOutputReadLine();
             process.BeginErrorReadLine();
 
@@ -198,11 +200,16 @@ internal sealed class GhostscriptRunner
         }
         finally
         {
+            bool hasExited = processStarted && process.HasExited;
+            bool isSuccess = hasExited && process.ExitCode == 0;
+            int exitCode = hasExited ? process.ExitCode : -1;
+
             logger.Info("Ghostscript finished",
                 ("operation", operation),
                 ("attempt", attempt),
-                ("success", process.HasExited && process.ExitCode == 0),
-                ("exitCode", process.HasExited ? process.ExitCode : -1));
+                ("started", processStarted),
+                ("success", isSuccess),
+                ("exitCode", exitCode));
         }
     }
 
