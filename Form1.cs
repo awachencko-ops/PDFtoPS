@@ -8,13 +8,15 @@ using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
 using System.Windows.Forms;
 
 namespace PDFtoPS
 {
     public partial class PDFtoPS : Form
     {
-        // --- 1. —≈ ÷»ﬂ WINDOWS API ---
+        // --- 1. –°–ï–ö–¶–ò–Ø WINDOWS API ---
         [DllImport("user32.dll")]
         private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
         private const uint LVM_SETINSERTMARK = 0x10A6;
@@ -63,9 +65,9 @@ namespace PDFtoPS
         private const int HDF_SORTUP = 0x0400;
         private const int HDF_SORTDOWN = 0x0200;
 
-        // --- 2. œ≈–≈Ã≈ÕÕ€≈  À¿——¿ ---
+        // --- 2. –ü–ï–†–ï–ú–ï–ù–ù–´–ï –ö–õ–ê–°–°–ê ---
 
-        // ›ÎÂÏÂÌÚ˚ ÒÚ‡ÚÛÒ-·‡‡ (ÒÓÁ‰‡‰ËÏ Ëı ÔÓ„‡ÏÏÌÓ)
+        // –≠–ª–µ–º–µ–Ω—Ç—ã —Å—Ç–∞—Ç—É—Å-–±–∞—Ä–∞ (—Å–æ–∑–¥–∞–¥–∏–º –∏—Ö –ø—Ä–æ–≥—Ä–∞–º–º–Ω–æ)
         private StatusStrip statusStrip;
         private ToolStripProgressBar progressBar;
         private ToolStripStatusLabel statusLabel;
@@ -74,6 +76,9 @@ namespace PDFtoPS
         private int lastInsertionIndex = -1;
         private int lastSortColumn = -1;
         private SortOrder lastSortOrder = SortOrder.Ascending;
+        private readonly TimeSpan ghostscriptTimeout = TimeSpan.FromMinutes(5);
+        private const int GhostscriptRetryCount = 2;
+        private const int GhostscriptRetryDelayMs = 800;
 
         private Dictionary<string, string> profiles = new Dictionary<string, string>
         {
@@ -82,7 +87,7 @@ namespace PDFtoPS
             { "Grayscale", "-sDEVICE=ps2write -dLanguageLevel=3" }
         };
 
-        // --- 3.  ŒÕ—“–” “Œ– ---
+        // --- 3. –ö–û–ù–°–¢–†–£–ö–¢–û–† ---
         public PDFtoPS()
         {
             InitializeComponent();
@@ -98,23 +103,23 @@ namespace PDFtoPS
             if (comboBoxProfiles.Items.Count > 0) comboBoxProfiles.SelectedIndex = 0;
             listViewFiles.AllowDrop = true;
 
-            InitInterfaceComponents(); // »ÌËˆË‡ÎËÁ‡ˆËˇ ÒÚ‡ÚÛÒ-·‡‡ Ë ÒÔËÒÍÓ‚
+            InitInterfaceComponents(); // –ò–Ω–∏—Ü–∏–∞–ª–∏–∑–∞—Ü–∏—è —Å—Ç–∞—Ç—É—Å-–±–∞—Ä–∞ –∏ —Å–ø–∏—Å–∫–æ–≤
 
             comboBoxProfiles.SelectedIndexChanged += comboBoxProfiles_SelectedIndexChanged;
             if (comboBoxProfiles.Items.Count > 0) comboBoxProfiles.SelectedIndex = 0;
         }
 
-        // --- 4. Ã≈“Œƒ€ √≈Õ≈–¿÷»» ¿–√”Ã≈Õ“Œ¬ ---
+        // --- 4. –ú–ï–¢–û–î–´ –ì–ï–ù–ï–†–ê–¶–ò–ò –ê–†–ì–£–ú–ï–ù–¢–û–í ---
 
         private string GetImageSettingsArgs()
         {
             List<string> args = new List<string>();
 
-            // ”ƒ¿À»À»: args.Add("-dPDFSETTINGS=/prepress"); 
-            // ›Ú‡ ÍÓÏ‡Ì‰‡ ÍÓÌÙÎËÍÚÓ‚‡Î‡ Ò Ì‡¯ËÏË Û˜Ì˚ÏË Ì‡ÒÚÓÈÍ‡ÏË Ë ‚˚Á˚‚‡Î‡ Ó¯Ë·ÍÛ 255.
-            // Õ‡¯Ë Û˜Ì˚Â Ì‡ÒÚÓÈÍË ÌËÊÂ ‰ÓÒÚ‡ÚÓ˜ÌÓ ÏÓ˘Ì˚Â Ò‡ÏË ÔÓ ÒÂ·Â.
+            // –£–î–ê–õ–ò–õ–ò: args.Add("-dPDFSETTINGS=/prepress"); 
+            // –≠—Ç–∞ –∫–æ–º–∞–Ω–¥–∞ –∫–æ–Ω—Ñ–ª–∏–∫—Ç–æ–≤–∞–ª–∞ —Å –Ω–∞—à–∏–º–∏ —Ä—É—á–Ω—ã–º–∏ –Ω–∞—Å—Ç—Ä–æ–π–∫–∞–º–∏ –∏ –≤—ã–∑—ã–≤–∞–ª–∞ –æ—à–∏–±–∫—É 255.
+            // –ù–∞—à–∏ —Ä—É—á–Ω—ã–µ –Ω–∞—Å—Ç—Ä–æ–π–∫–∏ –Ω–∏–∂–µ –¥–æ—Å—Ç–∞—Ç–æ—á–Ω–æ –º–æ—â–Ω—ã–µ —Å–∞–º–∏ –ø–æ —Å–µ–±–µ.
 
-            // 1. ÷¬≈“Õ€≈ » —≈–€≈
+            // 1. –¶–í–ï–¢–ù–´–ï –ò –°–ï–†–´–ï
             if (cmbColorDPI.SelectedIndex > 0)
             {
                 string dpiText = cmbColorDPI.SelectedItem.ToString().Split(' ')[0];
@@ -129,14 +134,14 @@ namespace PDFtoPS
                 args.Add($"-dGrayImageDownsampleType={method}");
             }
 
-            // 2. ÃŒÕŒ’–ŒÃÕ€≈ (◊≈–“≈∆»)
+            // 2. –ú–û–ù–û–•–†–û–ú–ù–´–ï (–ß–ï–†–¢–ï–ñ–ò)
             if (cmbMonoDPI.SelectedIndex > 0)
             {
                 string monoDpiText = cmbMonoDPI.SelectedItem.ToString();
 
-                // ≈ÒÎË ‚˚·‡ÌÓ 1200 - ÓÚÍÎ˛˜‡ÂÏ ‰‡ÛÌÒÂÏÔÎËÌ„. 
-                //  ‡ÚËÌÍ‡ ÔÓÈ‰ÂÚ ‚ ÓË„ËÌ‡Î¸ÌÓÏ Í‡˜ÂÒÚ‚Â (ıÓÚ¸ 2400, ıÓÚ¸ 5000 dpi).
-                // ›ÚÓ ÎÛ˜¯ÂÂ Â¯ÂÌËÂ ‰Îˇ CTP.
+                // –ï—Å–ª–∏ –≤—ã–±—Ä–∞–Ω–æ 1200 - –æ—Ç–∫–ª—é—á–∞–µ–º –¥–∞—É–Ω—Å–µ–º–ø–ª–∏–Ω–≥. 
+                // –ö–∞—Ä—Ç–∏–Ω–∫–∞ –ø–æ–π–¥–µ—Ç –≤ –æ—Ä–∏–≥–∏–Ω–∞–ª—å–Ω–æ–º –∫–∞—á–µ—Å—Ç–≤–µ (—Ö–æ—Ç—å 2400, —Ö–æ—Ç—å 5000 dpi).
+                // –≠—Ç–æ –ª—É—á—à–µ–µ —Ä–µ—à–µ–Ω–∏–µ –¥–ª—è CTP.
                 if (monoDpiText == "1200")
                 {
                     args.Add("-dDownsampleMonoImages=false");
@@ -149,7 +154,7 @@ namespace PDFtoPS
                 }
             }
 
-            // 3. —∆¿“»≈
+            // 3. –°–ñ–ê–¢–ò–ï
             if (cmbJpegQuality.SelectedIndex == 0) // Maximum
             {
                 args.Add("-sColorImageFilter=/FlateEncode");
@@ -166,7 +171,7 @@ namespace PDFtoPS
         private string GetFontArgs()
         {
             if (cmbFonts.SelectedIndex == 0) return "-dEmbedAllFonts=true -dSubsetFonts=true";
-            else return "-dNoOutputFonts"; //  Ë‚˚Â
+            else return "-dNoOutputFonts"; // –ö—Ä–∏–≤—ã–µ
         }
 
         private string GetColorArgs()
@@ -194,13 +199,13 @@ namespace PDFtoPS
             return "";
         }
 
-        // --- ÀŒ√» ¿ »Õ“≈–‘≈…—¿ ---
+        // --- –õ–û–ì–ò–ö–ê –ò–ù–¢–ï–†–§–ï–ô–°–ê ---
 
         private void InitInterfaceComponents()
         {
-            // 2. «¿œŒÀÕﬂ≈Ã —œ»— »
+            // 2. –ó–ê–ü–û–õ–ù–Ø–ï–ú –°–ü–ò–°–ö–ò
             cmbColorDPI.Items.Clear();
-            cmbColorDPI.Items.AddRange(new object[] { "¡ÂÁ ËÁÏÂÌÂÌËÈ", "300 (Print)", "150 (Office)", "72 (Screen)" });
+            cmbColorDPI.Items.AddRange(new object[] { "–ë–µ–∑ –∏–∑–º–µ–Ω–µ–Ω–∏–π", "300 (Print)", "150 (Office)", "72 (Screen)" });
             cmbColorDPI.SelectedIndex = 1;
 
             cmbDownsampleType.Items.Clear();
@@ -208,7 +213,7 @@ namespace PDFtoPS
             cmbDownsampleType.SelectedIndex = 0;
 
             cmbMonoDPI.Items.Clear();
-            cmbMonoDPI.Items.AddRange(new object[] { "¡ÂÁ ËÁÏÂÌÂÌËÈ", "1200", "600", "300" });
+            cmbMonoDPI.Items.AddRange(new object[] { "–ë–µ–∑ –∏–∑–º–µ–Ω–µ–Ω–∏–π", "1200", "600", "300" });
             cmbMonoDPI.SelectedIndex = 1;
 
             cmbJpegQuality.Items.Clear();
@@ -216,16 +221,16 @@ namespace PDFtoPS
             cmbJpegQuality.SelectedIndex = 0;
 
             cmbFonts.Items.Clear();
-            cmbFonts.Items.AddRange(new object[] { "¬ÒÚ‡Ë‚‡Ú¸ ¯ËÙÚ˚ (Standard)", "œÂÓ·‡ÁÓ‚‡Ú¸ ‚ ÍË‚˚Â (Safe Mode)" });
+            cmbFonts.Items.AddRange(new object[] { "–í—Å—Ç—Ä–∞–∏–≤–∞—Ç—å —à—Ä–∏—Ñ—Ç—ã (Standard)", "–ü—Ä–µ–æ–±—Ä–∞–∑–æ–≤–∞—Ç—å –≤ –∫—Ä–∏–≤—ã–µ (Safe Mode)" });
             cmbFonts.SelectedIndex = 1;
 
             cmbColorModel.Items.Clear();
-            cmbColorModel.Items.AddRange(new object[] { "¡ÂÁ ËÁÏÂÌÂÌËÈ", "œËÌÛ‰ËÚÂÎ¸ÌÓ CMYK (Print)", "√‡‰‡ˆËË ÒÂÓ„Ó (Gray)" });
+            cmbColorModel.Items.AddRange(new object[] { "–ë–µ–∑ –∏–∑–º–µ–Ω–µ–Ω–∏–π", "–ü—Ä–∏–Ω—É–¥–∏—Ç–µ–ª—å–Ω–æ CMYK (Print)", "–ì—Ä–∞–¥–∞—Ü–∏–∏ —Å–µ—Ä–æ–≥–æ (Gray)" });
             cmbColorModel.SelectedIndex = 1;
 
             cmbPageSize.Items.Clear();
             cmbPageSize.Items.AddRange(new object[] {
-                " ‡Í ‚ ‰ÓÍÛÏÂÌÚÂ (From PDF)",
+                "–ö–∞–∫ –≤ –¥–æ–∫—É–º–µ–Ω—Ç–µ (From PDF)",
                 "CTP Plate (510 x 400 mm)",
                 "A4 (210 x 297 mm)",
                 "A3 (297 x 420 mm)"
@@ -236,11 +241,11 @@ namespace PDFtoPS
         private void comboBoxProfiles_SelectedIndexChanged(object sender, EventArgs e)
         {
             string selectedProfile = comboBoxProfiles.SelectedItem.ToString();
-            // ÷‚ÂÚ
+            // –¶–≤–µ—Ç
             if (selectedProfile.Contains("Grayscale")) cmbColorModel.SelectedIndex = 2;
             else cmbColorModel.SelectedIndex = 1;
 
-            // –‡ÁÂ¯ÂÌËÂ
+            // –†–∞–∑—Ä–µ—à–µ–Ω–∏–µ
             if (selectedProfile.Contains("Standard") || selectedProfile.Contains("Level 3"))
             {
                 cmbColorDPI.SelectedIndex = 1; cmbDownsampleType.SelectedIndex = 0; cmbMonoDPI.SelectedIndex = 1;
@@ -255,25 +260,29 @@ namespace PDFtoPS
             }
         }
 
-        // ---  ÕŒœ » » —Œ¡€“»ﬂ ---
+        // --- –ö–ù–û–ü–ö–ò –ò –°–û–ë–´–¢–ò–Ø ---
 
         private void btnConvert_Click(object sender, EventArgs e)
         {
-            string gsPath = @"C:\Program Files\gs\gs10.03.1\bin\gswin64c.exe";
-            if (!File.Exists(gsPath)) { MessageBox.Show("Ghostscript ÌÂ Ì‡È‰ÂÌ!"); return; }
+            string gsPath = ResolveGhostscriptPath();
+            if (string.IsNullOrWhiteSpace(gsPath) || !File.Exists(gsPath))
+            {
+                MessageBox.Show("Ghostscript –Ω–µ –Ω–∞–π–¥–µ–Ω. –£–∫–∞–∂–∏—Ç–µ –ø—É—Ç—å –≤ –ø–µ—Ä–µ–º–µ–Ω–Ω–æ–π –æ–∫—Ä—É–∂–µ–Ω–∏—è GHOSTSCRIPT_PATH –∏–ª–∏ —É—Å—Ç–∞–Ω–æ–≤–∏—Ç–µ Ghostscript –≤ —Å—Ç–∞–Ω–¥–∞—Ä—Ç–Ω—É—é –ø–∞–ø–∫—É C:\\Program Files\\gs\\...\\bin\\gswin64c.exe.");
+                return;
+            }
             if (listViewFiles.Items.Count == 0) return;
 
             string outputDir = txtOutputPath.Text;
-            if (string.IsNullOrEmpty(outputDir) || !Directory.Exists(outputDir)) { MessageBox.Show("¬˚·ÂËÚÂ Ô‡ÔÍÛ!"); return; }
+            if (string.IsNullOrEmpty(outputDir) || !Directory.Exists(outputDir)) { MessageBox.Show("–í—ã–±–µ—Ä–∏—Ç–µ –ø–∞–ø–∫—É!"); return; }
 
-            // --- Õ¿—“–Œ… ¿ ¬¿ÿ≈√Œ PROGRESSBAR ---
+            // --- –ù–ê–°–¢–†–û–ô–ö–ê –í–ê–®–ï–ì–û PROGRESSBAR ---
             progressBar1.Minimum = 0;
             progressBar1.Maximum = listViewFiles.Items.Count;
             progressBar1.Value = 0;
             progressBar1.Step = 1;
-            progressBar1.Visible = true; // œÓÍ‡Á˚‚‡ÂÏ ·‡
+            progressBar1.Visible = true; // –ü–æ–∫–∞–∑—ã–≤–∞–µ–º –±–∞—Ä
 
-            // --- Õ¿—“–Œ… »  ŒÕ¬≈–“¿÷»» ---
+            // --- –ù–ê–°–¢–†–û–ô–ö–ò –ö–û–ù–í–ï–†–¢–ê–¶–ò–ò ---
             string pdfSettings = GetPdfSettings();
             string colorArgs = "-sProcessColorModel=DeviceCMYK -sColorConversionStrategy=CMYK";
             string sizeArgs = GetPageSizeArgs();
@@ -281,9 +290,9 @@ namespace PDFtoPS
             string psFontArgs = GetFontArgs();
 
             int successCount = 0;
-            string originalTitle = this.Text; // «‡ÔÓÏËÌ‡ÂÏ Ì‡Á‚‡ÌËÂ ÔÓ„‡ÏÏ˚
+            string originalTitle = this.Text; // –ó–∞–ø–æ–º–∏–Ω–∞–µ–º –Ω–∞–∑–≤–∞–Ω–∏–µ –ø—Ä–æ–≥—Ä–∞–º–º—ã
 
-            // ¬ÂÏÂÌÌ‡ˇ Ô‡ÔÍ‡
+            // –í—Ä–µ–º–µ–Ω–Ω–∞—è –ø–∞–ø–∫–∞
             string tempWorkDir = Path.Combine(Path.GetTempPath(), "PDFtoPS_Work");
             if (!Directory.Exists(tempWorkDir)) Directory.CreateDirectory(tempWorkDir);
 
@@ -300,22 +309,22 @@ namespace PDFtoPS
                 {
                     File.Copy(inputPath, safeInput, true);
 
-                    // ÿ¿√ 1: ÕŒ–Ã¿À»«¿÷»ﬂ
-                    // œË¯ÂÏ ÒÚ‡ÚÛÒ ‚ Á‡„ÓÎÓ‚ÓÍ ÓÍÌ‡
-                    this.Text = $"ÕÓÏ‡ÎËÁ‡ˆËˇ: {fileName}...";
-                    Application.DoEvents(); // ◊ÚÓ·˚ ËÌÚÂÙÂÈÒ ÌÂ Á‡‚ËÒ
+                    // –®–ê–ì 1: –ù–û–†–ú–ê–õ–ò–ó–ê–¶–ò–Ø
+                    // –ü–∏—à–µ–º —Å—Ç–∞—Ç—É—Å –≤ –∑–∞–≥–æ–ª–æ–≤–æ–∫ –æ–∫–Ω–∞
+                    this.Text = $"–ù–æ—Ä–º–∞–ª–∏–∑–∞—Ü–∏—è: {fileName}...";
+                    Application.DoEvents(); // –ß—Ç–æ–±—ã –∏–Ω—Ç–µ—Ä—Ñ–µ–π—Å –Ω–µ –∑–∞–≤–∏—Å
 
                     string pass1Args = $"-dNOPAUSE -dBATCH -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 " +
                                        $"{pdfSettings} {colorArgs} {pdfFontArgs} " +
                                        $"-sOutputFile=\"{safeNorm}\" \"{safeInput}\"";
 
-                    if (!RunGhostscript(gsPath, pass1Args, out string err1))
+                    if (!RunGhostscriptWithRetry(gsPath, pass1Args, out string err1))
                     {
-                        throw new Exception($"Œ¯Ë·Í‡ pdfwrite (Pass 1):\n{err1}");
+                        throw new Exception($"–û—à–∏–±–∫–∞ pdfwrite (Pass 1):\n{err1}");
                     }
 
-                    // ÿ¿√ 2: √≈Õ≈–¿÷»ﬂ PS
-                    this.Text = $"√ÂÌÂ‡ˆËˇ PS: {fileName}...";
+                    // –®–ê–ì 2: –ì–ï–ù–ï–†–ê–¶–ò–Ø PS
+                    this.Text = $"–ì–µ–Ω–µ—Ä–∞—Ü–∏—è PS: {fileName}...";
                     Application.DoEvents();
 
                     string profileArgs = profiles[comboBoxProfiles.SelectedItem.ToString()];
@@ -323,18 +332,23 @@ namespace PDFtoPS
                     string pass2Args = $"-dNOPAUSE -dBATCH {profileArgs} -r2400 {sizeArgs} {psFontArgs} " +
                                        $"-sOutputFile=\"{finalPsPath}\" \"{safeNorm}\"";
 
-                    if (RunGhostscript(gsPath, pass2Args, out string err2))
+                    if (RunGhostscriptWithRetry(gsPath, pass2Args, out string err2))
                     {
+                        if (!File.Exists(finalPsPath))
+                        {
+                            throw new Exception("Ghostscript –∑–∞–≤–µ—Ä—à–∏–ª—Å—è –±–µ–∑ –æ—à–∏–±–∫–∏, –Ω–æ –≤—ã—Ö–æ–¥–Ω–æ–π PS-—Ñ–∞–π–ª –Ω–µ –±—ã–ª —Å–æ–∑–¥–∞–Ω.");
+                        }
+
                         successCount++;
                     }
                     else
                     {
-                        throw new Exception($"Œ¯Ë·Í‡ ps2write (Pass 2):\n{err2}");
+                        throw new Exception($"–û—à–∏–±–∫–∞ ps2write (Pass 2):\n{err2}");
                     }
                 }
                 catch (Exception ex)
                 {
-                    MessageBox.Show($"‘‡ÈÎ: {fileName}\n\n{ex.Message}", "—·ÓÈ", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    MessageBox.Show($"–§–∞–π–ª: {fileName}\n\n{ex.Message}", "–°–±–æ–π", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
                 finally
                 {
@@ -342,73 +356,136 @@ namespace PDFtoPS
                     try { if (File.Exists(safeNorm)) File.Delete(safeNorm); } catch { }
                 }
 
-                // ƒ‚Ë„‡ÂÏ ÔÓ„ÂÒÒ-·‡
+                // –î–≤–∏–≥–∞–µ–º –ø—Ä–æ–≥—Ä–µ—Å—Å-–±–∞—Ä
                 progressBar1.PerformStep();
             }
 
             try { Directory.Delete(tempWorkDir, true); } catch { }
 
-            // ¬ÓÁ‚‡˘‡ÂÏ Á‡„ÓÎÓ‚ÓÍ Ë Ò·‡Ò˚‚‡ÂÏ ·‡
+            // –í–æ–∑–≤—Ä–∞—â–∞–µ–º –∑–∞–≥–æ–ª–æ–≤–æ–∫ –∏ —Å–±—Ä–∞—Å—ã–≤–∞–µ–º –±–∞—Ä
             this.Text = originalTitle;
             progressBar1.Value = 0;
 
-            MessageBox.Show($"√ÓÚÓ‚Ó! ”ÒÔÂ¯ÌÓ: {successCount} ËÁ {listViewFiles.Items.Count}");
+            MessageBox.Show($"–ì–æ—Ç–æ–≤–æ! –£—Å–ø–µ—à–Ω–æ: {successCount} –∏–∑ {listViewFiles.Items.Count}");
             if (successCount > 0) Process.Start("explorer.exe", outputDir);
         }
 
-        // --- ÕŒ¬€… Ã≈“Œƒ ƒÀﬂ Œœ–≈ƒ≈À≈Õ»ﬂ œ–Œ‘»Àﬂ ---
+        // --- –ù–û–í–´–ô –ú–ï–¢–û–î –î–õ–Ø –û–ü–†–ï–î–ï–õ–ï–ù–ò–Ø –ü–†–û–§–ò–õ–Ø ---
         private string GetPdfSettings()
         {
-            // ŒÔÂ‰ÂÎˇÂÏ ÔÂÒÂÚ Ì‡ ÓÒÌÓ‚Â ‚˚·Ó‡ DPI ‚ ËÌÚÂÙÂÈÒÂ.
+            // –û–ø—Ä–µ–¥–µ–ª—è–µ–º –ø—Ä–µ—Å–µ—Ç –Ω–∞ –æ—Å–Ω–æ–≤–µ –≤—ã–±–æ—Ä–∞ DPI –≤ –∏–Ω—Ç–µ—Ä—Ñ–µ–π—Å–µ.
             // /printer = 300 dpi (High Quality)
-            // /prepress = ¡ÂÁ ‰‡ÛÌÒÂÏÔÎËÌ„‡ (Original Quality)
+            // /prepress = –ë–µ–∑ –¥–∞—É–Ω—Å–µ–º–ø–ª–∏–Ω–≥–∞ (Original Quality)
             // /ebook = 150 dpi
             // /screen = 72 dpi
 
-            // —ÏÓÚËÏ Ì‡ cmbColorDPI (ËÌ‰ÂÍÒ 1 ˝ÚÓ "300 (Print)")
+            // –°–º–æ—Ç—Ä–∏–º –Ω–∞ cmbColorDPI (–∏–Ω–¥–µ–∫—Å 1 —ç—Ç–æ "300 (Print)")
             int dpiIndex = cmbColorDPI.SelectedIndex;
 
             switch (dpiIndex)
             {
-                case 0: return "-dPDFSETTINGS=/prepress"; // ¡ÂÁ ËÁÏÂÌÂÌËÈ (‚˚ÒÓÍÓÂ Í‡˜ÂÒÚ‚Ó)
-                case 1: return "-dPDFSETTINGS=/printer";  // 300 dpi (—“¿Õƒ¿–“) - Ò‡ÏÓÂ ÒÚ‡·ËÎ¸ÌÓÂ
+                case 0: return "-dPDFSETTINGS=/prepress"; // –ë–µ–∑ –∏–∑–º–µ–Ω–µ–Ω–∏–π (–≤—ã—Å–æ–∫–æ–µ –∫–∞—á–µ—Å—Ç–≤–æ)
+                case 1: return "-dPDFSETTINGS=/printer";  // 300 dpi (–°–¢–ê–ù–î–ê–†–¢) - —Å–∞–º–æ–µ —Å—Ç–∞–±–∏–ª—å–Ω–æ–µ
                 case 2: return "-dPDFSETTINGS=/ebook";    // 150 dpi
                 case 3: return "-dPDFSETTINGS=/screen";   // 72 dpi
                 default: return "-dPDFSETTINGS=/printer";
             }
         }
 
-        // Œ—“¿¬Àﬂ≈Ã Ã≈“Œƒ «¿œ”— ¿ ¡≈« »«Ã≈Õ≈Õ»…
+        private string ResolveGhostscriptPath()
+        {
+            string envPath = Environment.GetEnvironmentVariable("GHOSTSCRIPT_PATH");
+            if (!string.IsNullOrWhiteSpace(envPath) && File.Exists(envPath)) return envPath;
+
+            string[] roots = new[]
+            {
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "gs"),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "gs")
+            };
+
+            foreach (string root in roots)
+            {
+                if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root)) continue;
+
+                string[] candidates = Directory.GetFiles(root, "gswin64c.exe", SearchOption.AllDirectories)
+                    .Concat(Directory.GetFiles(root, "gswin32c.exe", SearchOption.AllDirectories))
+                    .OrderByDescending(f => f)
+                    .ToArray();
+
+                if (candidates.Length > 0) return candidates[0];
+            }
+
+            return string.Empty;
+        }
+
+        private string BuildGhostscriptArguments(string arguments)
+        {
+            return $"-dSAFER -dNOPROMPT -dQUIET {arguments}";
+        }
+
+        private bool RunGhostscriptWithRetry(string gsPath, string arguments, out string errorMsg)
+        {
+            errorMsg = string.Empty;
+            for (int attempt = 1; attempt <= GhostscriptRetryCount; attempt++)
+            {
+                if (RunGhostscript(gsPath, arguments, out string currentError)) return true;
+
+                errorMsg = currentError;
+                if (attempt < GhostscriptRetryCount)
+                {
+                    Thread.Sleep(GhostscriptRetryDelayMs);
+                }
+            }
+
+            return false;
+        }
+
+        // –û–°–¢–ê–í–õ–Ø–ï–ú –ú–ï–¢–û–î –ó–ê–ü–£–°–ö–ê –ë–ï–ó –ò–ó–ú–ï–ù–ï–ù–ò–ô
         private bool RunGhostscript(string gsPath, string arguments, out string errorMsg)
         {
             errorMsg = "";
             ProcessStartInfo psi = new ProcessStartInfo
             {
                 FileName = gsPath,
-                Arguments = arguments,
+                Arguments = BuildGhostscriptArguments(arguments),
                 CreateNoWindow = true,
                 UseShellExecute = false,
                 RedirectStandardError = true,
                 RedirectStandardOutput = true
             };
 
-            using (Process p = Process.Start(psi))
+            using (Process p = new Process { StartInfo = psi })
             {
-                string output = p.StandardOutput.ReadToEnd();
-                string error = p.StandardError.ReadToEnd();
+                StringBuilder output = new StringBuilder();
+                StringBuilder error = new StringBuilder();
+
+                p.OutputDataReceived += (_, e) => { if (e.Data != null) output.AppendLine(e.Data); };
+                p.ErrorDataReceived += (_, e) => { if (e.Data != null) error.AppendLine(e.Data); };
+
+                p.Start();
+                p.BeginOutputReadLine();
+                p.BeginErrorReadLine();
+
+                if (!p.WaitForExit((int)ghostscriptTimeout.TotalMilliseconds))
+                {
+                    try { p.Kill(true); } catch { }
+                    errorMsg = $"Ghostscript timeout after {ghostscriptTimeout.TotalMinutes:0} min.";
+                    return false;
+                }
+
                 p.WaitForExit();
 
                 if (p.ExitCode != 0)
                 {
                     errorMsg = $"ExitCode: {p.ExitCode}\nStdErr: {error}\nStdOut: {output}";
-                    Clipboard.SetText($"CMD: \"{gsPath}\" {arguments}\n\nERR: {errorMsg}");
+                    try { Clipboard.SetText($"CMD: \"{gsPath}\" {psi.Arguments}\n\nERR: {errorMsg}"); } catch { }
                     return false;
                 }
                 return true;
             }
         }
 
-        // --- Œ—“¿À‹Õ€≈ Ã≈“Œƒ€ —œ»— ¿ (·ÂÁ ËÁÏÂÌÂÌËÈ) ---
+        // --- –û–°–¢–ê–õ–¨–ù–´–ï –ú–ï–¢–û–î–´ –°–ü–ò–°–ö–ê (–±–µ–∑ –∏–∑–º–µ–Ω–µ–Ω–∏–π) ---
         private void UpdateRowNumbers() { for (int i = 0; i < listViewFiles.Items.Count; i++) listViewFiles.Items[i].Text = (i + 1).ToString(); }
         private string GetFileSize(string path) { try { long b = new FileInfo(path).Length; return b >= 1048576 ? (b / 1048576.0).ToString("0.##") + " MB" : (b / 1024.0).ToString("0.##") + " KB"; } catch { return "0 KB"; } }
         private void AddFileToListView(string path) { if (Path.GetExtension(path).ToLower() != ".pdf") return; FileInfo fi = new FileInfo(path); ListViewItem item = new ListViewItem(""); item.SubItems.Add(fi.Name); item.SubItems.Add(GetFileSize(path)); item.SubItems.Add(fi.LastWriteTime.ToString("yyyy-MM-dd HH:mm")); item.Tag = path; listViewFiles.Items.Add(item); UpdateRowNumbers(); }
