@@ -8,8 +8,6 @@ using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
-using System.Text;
-using System.Threading;
 using System.Windows.Forms;
 
 namespace PDFtoPS
@@ -76,9 +74,8 @@ namespace PDFtoPS
         private int lastInsertionIndex = -1;
         private int lastSortColumn = -1;
         private SortOrder lastSortOrder = SortOrder.Ascending;
-        private readonly TimeSpan ghostscriptTimeout = TimeSpan.FromMinutes(5);
-        private const int GhostscriptRetryCount = 2;
-        private const int GhostscriptRetryDelayMs = 800;
+        private readonly AppLogger logger;
+        private readonly GhostscriptRunner ghostscriptRunner;
 
         private Dictionary<string, string> profiles = new Dictionary<string, string>
         {
@@ -91,6 +88,8 @@ namespace PDFtoPS
         public PDFtoPS()
         {
             InitializeComponent();
+            logger = new AppLogger();
+            ghostscriptRunner = new GhostscriptRunner(TimeSpan.FromMinutes(5), retryCount: 2, retryDelayMs: 800, logger);
 
             SetWindowTheme(listViewFiles.Handle, "explorer", null);
             IntPtr hHeader = SendMessage(listViewFiles.Handle, LVM_GETHEADER, IntPtr.Zero, IntPtr.Zero);
@@ -264,10 +263,11 @@ namespace PDFtoPS
 
         private void btnConvert_Click(object sender, EventArgs e)
         {
-            string gsPath = ResolveGhostscriptPath();
+            string gsPath = ghostscriptRunner.ResolveGhostscriptPath();
             if (string.IsNullOrWhiteSpace(gsPath) || !File.Exists(gsPath))
             {
                 MessageBox.Show("Ghostscript не найден. Укажите путь в переменной окружения GHOSTSCRIPT_PATH или установите Ghostscript в стандартную папку C:\\Program Files\\gs\\...\\bin\\gswin64c.exe.");
+                logger.Error("Ghostscript executable was not found.");
                 return;
             }
             if (listViewFiles.Items.Count == 0) return;
@@ -318,9 +318,15 @@ namespace PDFtoPS
                                        $"{pdfSettings} {colorArgs} {pdfFontArgs} " +
                                        $"-sOutputFile=\"{safeNorm}\" \"{safeInput}\"";
 
-                    if (!RunGhostscriptWithRetry(gsPath, pass1Args, out string err1))
+                    GhostscriptRunResult pass1Result = ghostscriptRunner.RunWithRetry(
+                        gsPath,
+                        pass1Args,
+                        operation: "pdfwrite-normalization",
+                        expectedOutputPath: safeNorm);
+
+                    if (!pass1Result.Success)
                     {
-                        throw new Exception($"Ошибка pdfwrite (Pass 1):\n{err1}");
+                        throw new Exception(BuildGhostscriptUiError("Ошибка pdfwrite (Pass 1)", pass1Result));
                     }
 
                     // ШАГ 2: ГЕНЕРАЦИЯ PS
@@ -332,18 +338,19 @@ namespace PDFtoPS
                     string pass2Args = $"-dNOPAUSE -dBATCH {profileArgs} -r2400 {sizeArgs} {psFontArgs} " +
                                        $"-sOutputFile=\"{finalPsPath}\" \"{safeNorm}\"";
 
-                    if (RunGhostscriptWithRetry(gsPath, pass2Args, out string err2))
-                    {
-                        if (!File.Exists(finalPsPath))
-                        {
-                            throw new Exception("Ghostscript завершился без ошибки, но выходной PS-файл не был создан.");
-                        }
+                    GhostscriptRunResult pass2Result = ghostscriptRunner.RunWithRetry(
+                        gsPath,
+                        pass2Args,
+                        operation: "ps2write-generation",
+                        expectedOutputPath: finalPsPath);
 
+                    if (pass2Result.Success)
+                    {
                         successCount++;
                     }
                     else
                     {
-                        throw new Exception($"Ошибка ps2write (Pass 2):\n{err2}");
+                        throw new Exception(BuildGhostscriptUiError("Ошибка ps2write (Pass 2)", pass2Result));
                     }
                 }
                 catch (Exception ex)
@@ -392,97 +399,16 @@ namespace PDFtoPS
             }
         }
 
-        private string ResolveGhostscriptPath()
+        private string BuildGhostscriptUiError(string title, GhostscriptRunResult result)
         {
-            string envPath = Environment.GetEnvironmentVariable("GHOSTSCRIPT_PATH");
-            if (!string.IsNullOrWhiteSpace(envPath) && File.Exists(envPath)) return envPath;
+            logger.Error(title,
+                ("errorCode", result.ErrorCode.ToString()),
+                ("message", result.Message),
+                ("exitCode", result.ExitCode?.ToString() ?? string.Empty),
+                ("stderr", result.StdErr),
+                ("stdout", result.StdOut));
 
-            string[] roots = new[]
-            {
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "gs"),
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "gs")
-            };
-
-            foreach (string root in roots)
-            {
-                if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root)) continue;
-
-                string[] candidates = Directory.GetFiles(root, "gswin64c.exe", SearchOption.AllDirectories)
-                    .Concat(Directory.GetFiles(root, "gswin32c.exe", SearchOption.AllDirectories))
-                    .OrderByDescending(f => f)
-                    .ToArray();
-
-                if (candidates.Length > 0) return candidates[0];
-            }
-
-            return string.Empty;
-        }
-
-        private string BuildGhostscriptArguments(string arguments)
-        {
-            return $"-dSAFER -dNOPROMPT -dQUIET {arguments}";
-        }
-
-        private bool RunGhostscriptWithRetry(string gsPath, string arguments, out string errorMsg)
-        {
-            errorMsg = string.Empty;
-            for (int attempt = 1; attempt <= GhostscriptRetryCount; attempt++)
-            {
-                if (RunGhostscript(gsPath, arguments, out string currentError)) return true;
-
-                errorMsg = currentError;
-                if (attempt < GhostscriptRetryCount)
-                {
-                    Thread.Sleep(GhostscriptRetryDelayMs);
-                }
-            }
-
-            return false;
-        }
-
-        // ОСТАВЛЯЕМ МЕТОД ЗАПУСКА БЕЗ ИЗМЕНЕНИЙ
-        private bool RunGhostscript(string gsPath, string arguments, out string errorMsg)
-        {
-            errorMsg = "";
-            ProcessStartInfo psi = new ProcessStartInfo
-            {
-                FileName = gsPath,
-                Arguments = BuildGhostscriptArguments(arguments),
-                CreateNoWindow = true,
-                UseShellExecute = false,
-                RedirectStandardError = true,
-                RedirectStandardOutput = true
-            };
-
-            using (Process p = new Process { StartInfo = psi })
-            {
-                StringBuilder output = new StringBuilder();
-                StringBuilder error = new StringBuilder();
-
-                p.OutputDataReceived += (_, e) => { if (e.Data != null) output.AppendLine(e.Data); };
-                p.ErrorDataReceived += (_, e) => { if (e.Data != null) error.AppendLine(e.Data); };
-
-                p.Start();
-                p.BeginOutputReadLine();
-                p.BeginErrorReadLine();
-
-                if (!p.WaitForExit((int)ghostscriptTimeout.TotalMilliseconds))
-                {
-                    try { p.Kill(true); } catch { }
-                    errorMsg = $"Ghostscript timeout after {ghostscriptTimeout.TotalMinutes:0} min.";
-                    return false;
-                }
-
-                p.WaitForExit();
-
-                if (p.ExitCode != 0)
-                {
-                    errorMsg = $"ExitCode: {p.ExitCode}\nStdErr: {error}\nStdOut: {output}";
-                    try { Clipboard.SetText($"CMD: \"{gsPath}\" {psi.Arguments}\n\nERR: {errorMsg}"); } catch { }
-                    return false;
-                }
-                return true;
-            }
+            return $"{title}\nКод: {result.ErrorCode}\n{result.Message}";
         }
 
         // --- ОСТАЛЬНЫЕ МЕТОДЫ СПИСКА (без изменений) ---
