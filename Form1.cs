@@ -8,7 +8,6 @@ using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
-using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 using System.Threading.Tasks;
@@ -82,13 +81,7 @@ namespace PDFtoPS
         private CancellationTokenSource conversionCts;
         private bool isConverting;
         private readonly int maxParallelConversions;
-
-        private sealed class FileConversionResult
-        {
-            public string FileName { get; init; } = string.Empty;
-            public bool Success { get; init; }
-            public string ErrorMessage { get; init; } = string.Empty;
-        }
+        private readonly PdfInputValidator pdfInputValidator;
 
         private readonly Dictionary<string, string> profiles;
 
@@ -101,6 +94,7 @@ namespace PDFtoPS
             maxParallelConversions = configuration.MaxParallelConversions;
 
             logger = new AppLogger();
+            pdfInputValidator = new PdfInputValidator(logger);
             ghostscriptRunner = new GhostscriptRunner(TimeSpan.FromMinutes(5), retryCount: 2, retryDelayMs: 800, logger);
             logger.Info("Configuration loaded", ("maxParallelConversions", maxParallelConversions), ("profilesCount", profiles.Count));
             RunGhostscriptHealthCheck();
@@ -443,7 +437,7 @@ namespace PDFtoPS
             {
                 ct.ThrowIfCancellationRequested();
 
-                if (!TryValidatePdfInput(inputPath, out string validationError))
+                if (!pdfInputValidator.TryValidate(inputPath, out string validationError))
                 {
                     return new FileConversionResult
                     {
@@ -506,57 +500,6 @@ namespace PDFtoPS
             {
                 try { if (File.Exists(safeInput)) File.Delete(safeInput); } catch { }
                 try { if (File.Exists(safeNorm)) File.Delete(safeNorm); } catch { }
-            }
-        }
-
-        private bool TryValidatePdfInput(string inputPath, out string errorMessage)
-        {
-            errorMessage = string.Empty;
-
-            try
-            {
-                FileInfo fileInfo = new FileInfo(inputPath);
-                if (!fileInfo.Exists)
-                {
-                    errorMessage = "Входной PDF-файл не найден.";
-                    return false;
-                }
-
-                if (fileInfo.Length < 8)
-                {
-                    errorMessage = "Файл слишком мал и не похож на валидный PDF.";
-                    return false;
-                }
-
-                using FileStream stream = File.OpenRead(inputPath);
-
-                Span<byte> header = stackalloc byte[5];
-                int readHeader = stream.Read(header);
-                if (readHeader < 5 || header[0] != (byte)'%' || header[1] != (byte)'P' || header[2] != (byte)'D' || header[3] != (byte)'F' || header[4] != (byte)'-')
-                {
-                    errorMessage = "Файл не распознан как PDF (нет сигнатуры %PDF-).";
-                    return false;
-                }
-
-                long sampleSize = Math.Min(fileInfo.Length, 262144);
-                stream.Position = 0;
-                byte[] buffer = new byte[sampleSize];
-                int sampleRead = stream.Read(buffer, 0, buffer.Length);
-                string sample = Encoding.ASCII.GetString(buffer, 0, sampleRead);
-
-                if (sample.Contains("/Encrypt", StringComparison.OrdinalIgnoreCase))
-                {
-                    errorMessage = "PDF выглядит как защищённый (/Encrypt). Конвертация может быть невозможна.";
-                    return false;
-                }
-
-                return true;
-            }
-            catch (Exception ex)
-            {
-                logger.Error("PDF pre-validation failed", ("inputPath", inputPath), ("error", ex.Message));
-                errorMessage = "Ошибка предварительной проверки PDF. Подробности в логах.";
-                return false;
             }
         }
 
