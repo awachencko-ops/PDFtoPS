@@ -80,7 +80,7 @@ namespace PDFtoPS
         private readonly GhostscriptRunner ghostscriptRunner;
         private CancellationTokenSource conversionCts;
         private bool isConverting;
-        private const int MaxParallelConversions = 2;
+        private readonly int maxParallelConversions;
 
         private sealed class FileConversionResult
         {
@@ -89,19 +89,19 @@ namespace PDFtoPS
             public string ErrorMessage { get; init; } = string.Empty;
         }
 
-        private Dictionary<string, string> profiles = new Dictionary<string, string>
-        {
-            { "Standard (PS Level 3)", "-sDEVICE=ps2write -dLanguageLevel=3" },
-            { "Legacy (PS Level 2)", "-sDEVICE=ps2write -dLanguageLevel=2" },
-            { "Grayscale", "-sDEVICE=ps2write -dLanguageLevel=3" }
-        };
+        private readonly Dictionary<string, string> profiles;
 
         // --- 3. КОНСТРУКТОР ---
         public PDFtoPS()
         {
             InitializeComponent();
+            AppConfiguration configuration = AppConfiguration.Load();
+            profiles = configuration.Profiles;
+            maxParallelConversions = configuration.MaxParallelConversions;
+
             logger = new AppLogger();
             ghostscriptRunner = new GhostscriptRunner(TimeSpan.FromMinutes(5), retryCount: 2, retryDelayMs: 800, logger);
+            logger.Info("Configuration loaded", ("maxParallelConversions", maxParallelConversions), ("profilesCount", profiles.Count));
             RunGhostscriptHealthCheck();
 
             SetWindowTheme(listViewFiles.Handle, "explorer", null);
@@ -324,7 +324,7 @@ namespace PDFtoPS
                 .Where(path => !string.IsNullOrWhiteSpace(path))
                 .ToList();
 
-            using SemaphoreSlim semaphore = new SemaphoreSlim(MaxParallelConversions, MaxParallelConversions);
+            using SemaphoreSlim semaphore = new SemaphoreSlim(maxParallelConversions, maxParallelConversions);
 
             try
             {
