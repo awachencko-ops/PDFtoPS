@@ -8,9 +8,9 @@ using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
-using System.Text;
 using System.Threading;
 using System.Windows.Forms;
+using System.Threading.Tasks;
 
 namespace PDFtoPS
 {
@@ -76,21 +76,28 @@ namespace PDFtoPS
         private int lastInsertionIndex = -1;
         private int lastSortColumn = -1;
         private SortOrder lastSortOrder = SortOrder.Ascending;
-        private readonly TimeSpan ghostscriptTimeout = TimeSpan.FromMinutes(5);
-        private const int GhostscriptRetryCount = 2;
-        private const int GhostscriptRetryDelayMs = 800;
+        private readonly AppLogger logger;
+        private readonly GhostscriptRunner ghostscriptRunner;
+        private CancellationTokenSource conversionCts;
+        private bool isConverting;
+        private readonly int maxParallelConversions;
+        private readonly PdfInputValidator pdfInputValidator;
 
-        private Dictionary<string, string> profiles = new Dictionary<string, string>
-        {
-            { "Standard (PS Level 3)", "-sDEVICE=ps2write -dLanguageLevel=3" },
-            { "Legacy (PS Level 2)", "-sDEVICE=ps2write -dLanguageLevel=2" },
-            { "Grayscale", "-sDEVICE=ps2write -dLanguageLevel=3" }
-        };
+        private readonly Dictionary<string, string> profiles;
 
         // --- 3. КОНСТРУКТОР ---
         public PDFtoPS()
         {
             InitializeComponent();
+            AppConfiguration configuration = AppConfiguration.Load();
+            profiles = configuration.Profiles;
+            maxParallelConversions = configuration.MaxParallelConversions;
+
+            logger = new AppLogger();
+            pdfInputValidator = new PdfInputValidator(logger);
+            ghostscriptRunner = new GhostscriptRunner(TimeSpan.FromMinutes(5), retryCount: 2, retryDelayMs: 800, logger);
+            logger.Info("Configuration loaded", ("maxParallelConversions", maxParallelConversions), ("profilesCount", profiles.Count));
+            RunGhostscriptHealthCheck();
 
             SetWindowTheme(listViewFiles.Handle, "explorer", null);
             IntPtr hHeader = SendMessage(listViewFiles.Handle, LVM_GETHEADER, IntPtr.Zero, IntPtr.Zero);
@@ -262,12 +269,19 @@ namespace PDFtoPS
 
         // --- КНОПКИ И СОБЫТИЯ ---
 
-        private void btnConvert_Click(object sender, EventArgs e)
+        private async void btnConvert_Click(object sender, EventArgs e)
         {
-            string gsPath = ResolveGhostscriptPath();
+            if (isConverting)
+            {
+                conversionCts?.Cancel();
+                return;
+            }
+
+            string gsPath = ghostscriptRunner.ResolveGhostscriptPath();
             if (string.IsNullOrWhiteSpace(gsPath) || !File.Exists(gsPath))
             {
                 MessageBox.Show("Ghostscript не найден. Укажите путь в переменной окружения GHOSTSCRIPT_PATH или установите Ghostscript в стандартную папку C:\\Program Files\\gs\\...\\bin\\gswin64c.exe.");
+                logger.Error("Ghostscript executable was not found.");
                 return;
             }
             if (listViewFiles.Items.Count == 0) return;
@@ -275,99 +289,218 @@ namespace PDFtoPS
             string outputDir = txtOutputPath.Text;
             if (string.IsNullOrEmpty(outputDir) || !Directory.Exists(outputDir)) { MessageBox.Show("Выберите папку!"); return; }
 
-            // --- НАСТРОЙКА ВАШЕГО PROGRESSBAR ---
+            conversionCts = new CancellationTokenSource();
+            CancellationToken ct = conversionCts.Token;
+            isConverting = true;
+
+            string originalButtonText = btnConvert.Text;
+            string originalTitle = this.Text;
+            btnConvert.Text = "Отмена";
+
             progressBar1.Minimum = 0;
             progressBar1.Maximum = listViewFiles.Items.Count;
             progressBar1.Value = 0;
             progressBar1.Step = 1;
-            progressBar1.Visible = true; // Показываем бар
+            progressBar1.Visible = true;
 
-            // --- НАСТРОЙКИ КОНВЕРТАЦИИ ---
             string pdfSettings = GetPdfSettings();
             string colorArgs = "-sProcessColorModel=DeviceCMYK -sColorConversionStrategy=CMYK";
             string sizeArgs = GetPageSizeArgs();
             string pdfFontArgs = "-dEmbedAllFonts=true -dSubsetFonts=true";
             string psFontArgs = GetFontArgs();
+            string profileArgs = profiles[comboBoxProfiles.SelectedItem.ToString()];
 
-            int successCount = 0;
-            string originalTitle = this.Text; // Запоминаем название программы
-
-            // Временная папка
+            int completedCount = 0;
             string tempWorkDir = Path.Combine(Path.GetTempPath(), "PDFtoPS_Work");
             if (!Directory.Exists(tempWorkDir)) Directory.CreateDirectory(tempWorkDir);
 
-            foreach (ListViewItem item in listViewFiles.Items)
+            var files = listViewFiles.Items.Cast<ListViewItem>()
+                .Select(item => item.Tag?.ToString())
+                .Where(path => !string.IsNullOrWhiteSpace(path))
+                .ToList();
+
+            using SemaphoreSlim semaphore = new SemaphoreSlim(maxParallelConversions, maxParallelConversions);
+
+            try
             {
-                string inputPath = item.Tag.ToString();
-                string fileName = Path.GetFileNameWithoutExtension(inputPath);
-
-                string safeInput = Path.Combine(tempWorkDir, $"in_{Guid.NewGuid().ToString().Substring(0, 8)}.pdf");
-                string safeNorm = Path.Combine(tempWorkDir, $"norm_{Guid.NewGuid().ToString().Substring(0, 8)}.pdf");
-                string finalPsPath = Path.Combine(outputDir, fileName + ".ps");
-
-                try
-                {
-                    File.Copy(inputPath, safeInput, true);
-
-                    // ШАГ 1: НОРМАЛИЗАЦИЯ
-                    // Пишем статус в заголовок окна
-                    this.Text = $"Нормализация: {fileName}...";
-                    Application.DoEvents(); // Чтобы интерфейс не завис
-
-                    string pass1Args = $"-dNOPAUSE -dBATCH -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 " +
-                                       $"{pdfSettings} {colorArgs} {pdfFontArgs} " +
-                                       $"-sOutputFile=\"{safeNorm}\" \"{safeInput}\"";
-
-                    if (!RunGhostscriptWithRetry(gsPath, pass1Args, out string err1))
+                List<Task<FileConversionResult>> tasks = files.Select(path => ProcessFileAsync(
+                    semaphore,
+                    ct,
+                    gsPath,
+                    path!,
+                    outputDir,
+                    tempWorkDir,
+                    pdfSettings,
+                    colorArgs,
+                    pdfFontArgs,
+                    profileArgs,
+                    sizeArgs,
+                    psFontArgs,
+                    fileName => InvokeOnUi(() => this.Text = $"Конвертация: {fileName}..."),
+                    () =>
                     {
-                        throw new Exception($"Ошибка pdfwrite (Pass 1):\n{err1}");
+                        int done = Interlocked.Increment(ref completedCount);
+                        InvokeOnUi(() => progressBar1.Value = Math.Min(done, progressBar1.Maximum));
+                    })).ToList();
+
+                FileConversionResult[] results = await Task.WhenAll(tasks);
+
+                int successCount = results.Count(r => r.Success);
+                var failed = results.Where(r => !r.Success).ToList();
+
+                if (failed.Count == 0)
+                {
+                    MessageBox.Show($"Готово! Успешно: {successCount} из {files.Count}");
+                }
+                else
+                {
+                    string details = string.Join(Environment.NewLine, failed.Take(5).Select(r => $"- {r.FileName}: {r.ErrorMessage}"));
+                    if (failed.Count > 5)
+                    {
+                        details += Environment.NewLine + $"... и ещё {failed.Count - 5} ошибок.";
                     }
 
-                    // ШАГ 2: ГЕНЕРАЦИЯ PS
-                    this.Text = $"Генерация PS: {fileName}...";
-                    Application.DoEvents();
-
-                    string profileArgs = profiles[comboBoxProfiles.SelectedItem.ToString()];
-
-                    string pass2Args = $"-dNOPAUSE -dBATCH {profileArgs} -r2400 {sizeArgs} {psFontArgs} " +
-                                       $"-sOutputFile=\"{finalPsPath}\" \"{safeNorm}\"";
-
-                    if (RunGhostscriptWithRetry(gsPath, pass2Args, out string err2))
-                    {
-                        if (!File.Exists(finalPsPath))
-                        {
-                            throw new Exception("Ghostscript завершился без ошибки, но выходной PS-файл не был создан.");
-                        }
-
-                        successCount++;
-                    }
-                    else
-                    {
-                        throw new Exception($"Ошибка ps2write (Pass 2):\n{err2}");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    MessageBox.Show($"Файл: {fileName}\n\n{ex.Message}", "Сбой", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                }
-                finally
-                {
-                    try { if (File.Exists(safeInput)) File.Delete(safeInput); } catch { }
-                    try { if (File.Exists(safeNorm)) File.Delete(safeNorm); } catch { }
+                    MessageBox.Show(
+                        $"Обработка завершена. Успешно: {successCount} из {files.Count}." + Environment.NewLine + Environment.NewLine + details,
+                        "Завершено с ошибками",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
                 }
 
-                // Двигаем прогресс-бар
-                progressBar1.PerformStep();
+                if (successCount > 0) Process.Start("explorer.exe", outputDir);
+            }
+            catch (OperationCanceledException)
+            {
+                MessageBox.Show($"Конвертация отменена. Обработано файлов: {completedCount} из {files.Count}", "Отмена", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            finally
+            {
+                try { Directory.Delete(tempWorkDir, true); } catch { }
+                this.Text = originalTitle;
+                progressBar1.Value = 0;
+                btnConvert.Text = originalButtonText;
+                isConverting = false;
+                conversionCts?.Dispose();
+                conversionCts = null;
+            }
+        }
+
+        private async Task<FileConversionResult> ProcessFileAsync(
+            SemaphoreSlim semaphore,
+            CancellationToken ct,
+            string gsPath,
+            string inputPath,
+            string outputDir,
+            string tempWorkDir,
+            string pdfSettings,
+            string colorArgs,
+            string pdfFontArgs,
+            string profileArgs,
+            string sizeArgs,
+            string psFontArgs,
+            Action<string> onStart,
+            Action onCompleted)
+        {
+            await semaphore.WaitAsync(ct);
+            string fileName = Path.GetFileNameWithoutExtension(inputPath);
+
+            try
+            {
+                onStart(fileName);
+                return await Task.Run(() => ConvertSingleFile(gsPath, inputPath, outputDir, tempWorkDir, fileName, pdfSettings, colorArgs, pdfFontArgs, profileArgs, sizeArgs, psFontArgs, ct), ct);
+            }
+            finally
+            {
+                onCompleted();
+                semaphore.Release();
+            }
+        }
+
+        private void InvokeOnUi(Action action)
+        {
+            if (InvokeRequired)
+            {
+                BeginInvoke(action);
+                return;
             }
 
-            try { Directory.Delete(tempWorkDir, true); } catch { }
+            action();
+        }
 
-            // Возвращаем заголовок и сбрасываем бар
-            this.Text = originalTitle;
-            progressBar1.Value = 0;
+        private FileConversionResult ConvertSingleFile(string gsPath, string inputPath, string outputDir, string tempWorkDir, string fileName, string pdfSettings, string colorArgs, string pdfFontArgs, string profileArgs, string sizeArgs, string psFontArgs, CancellationToken ct)
+        {
+            string safeInput = Path.Combine(tempWorkDir, $"in_{Guid.NewGuid().ToString().Substring(0, 8)}.pdf");
+            string safeNorm = Path.Combine(tempWorkDir, $"norm_{Guid.NewGuid().ToString().Substring(0, 8)}.pdf");
+            string finalPsPath = Path.Combine(outputDir, fileName + ".ps");
 
-            MessageBox.Show($"Готово! Успешно: {successCount} из {listViewFiles.Items.Count}");
-            if (successCount > 0) Process.Start("explorer.exe", outputDir);
+            try
+            {
+                ct.ThrowIfCancellationRequested();
+
+                if (!pdfInputValidator.TryValidate(inputPath, out string validationError))
+                {
+                    return new FileConversionResult
+                    {
+                        FileName = fileName,
+                        Success = false,
+                        ErrorMessage = validationError
+                    };
+                }
+
+                File.Copy(inputPath, safeInput, true);
+
+                string pass1Args = $"-dNOPAUSE -dBATCH -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 {pdfSettings} {colorArgs} {pdfFontArgs} -sOutputFile=\"{safeNorm}\" \"{safeInput}\"";
+                GhostscriptRunResult pass1Result = ghostscriptRunner.RunWithRetry(gsPath, pass1Args, "pdfwrite-normalization", safeNorm, ct);
+                if (!pass1Result.Success)
+                {
+                    if (pass1Result.ErrorCode == GhostscriptErrorCode.Cancelled) throw new OperationCanceledException(ct);
+                    return new FileConversionResult
+                    {
+                        FileName = fileName,
+                        Success = false,
+                        ErrorMessage = BuildGhostscriptUiError("Ошибка pdfwrite (Pass 1)", pass1Result)
+                    };
+                }
+
+                ct.ThrowIfCancellationRequested();
+                string pass2Args = $"-dNOPAUSE -dBATCH {profileArgs} -r2400 {sizeArgs} {psFontArgs} -sOutputFile=\"{finalPsPath}\" \"{safeNorm}\"";
+                GhostscriptRunResult pass2Result = ghostscriptRunner.RunWithRetry(gsPath, pass2Args, "ps2write-generation", finalPsPath, ct);
+                if (!pass2Result.Success)
+                {
+                    if (pass2Result.ErrorCode == GhostscriptErrorCode.Cancelled) throw new OperationCanceledException(ct);
+                    return new FileConversionResult
+                    {
+                        FileName = fileName,
+                        Success = false,
+                        ErrorMessage = BuildGhostscriptUiError("Ошибка ps2write (Pass 2)", pass2Result)
+                    };
+                }
+
+                return new FileConversionResult
+                {
+                    FileName = fileName,
+                    Success = true
+                };
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                logger.Error("Unhandled file conversion error", ("fileName", fileName), ("error", ex.Message));
+                return new FileConversionResult
+                {
+                    FileName = fileName,
+                    Success = false,
+                    ErrorMessage = ex.Message
+                };
+            }
+            finally
+            {
+                try { if (File.Exists(safeInput)) File.Delete(safeInput); } catch { }
+                try { if (File.Exists(safeNorm)) File.Delete(safeNorm); } catch { }
+            }
         }
 
         // --- НОВЫЙ МЕТОД ДЛЯ ОПРЕДЕЛЕНИЯ ПРОФИЛЯ ---
@@ -392,97 +525,39 @@ namespace PDFtoPS
             }
         }
 
-        private string ResolveGhostscriptPath()
+        private void RunGhostscriptHealthCheck()
         {
-            string envPath = Environment.GetEnvironmentVariable("GHOSTSCRIPT_PATH");
-            if (!string.IsNullOrWhiteSpace(envPath) && File.Exists(envPath)) return envPath;
-
-            string[] roots = new[]
+            string gsPath = ghostscriptRunner.ResolveGhostscriptPath();
+            if (string.IsNullOrWhiteSpace(gsPath) || !File.Exists(gsPath))
             {
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "gs"),
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "gs")
+                logger.Warning("Ghostscript health-check failed", ("reason", "executable_not_found"));
+                return;
+            }
+
+            logger.Info("Ghostscript health-check passed", ("path", gsPath));
+        }
+
+        private string BuildGhostscriptUiError(string title, GhostscriptRunResult result)
+        {
+            logger.Error(title,
+                ("errorCode", result.ErrorCode.ToString()),
+                ("message", result.Message),
+                ("exitCode", result.ExitCode?.ToString() ?? string.Empty),
+                ("stderr", result.StdErr),
+                ("stdout", result.StdOut));
+
+            string friendlyText = result.ErrorCode switch
+            {
+                GhostscriptErrorCode.ExecutableNotFound => "Не найден исполняемый файл Ghostscript. Проверьте GHOSTSCRIPT_PATH и установку Ghostscript.",
+                GhostscriptErrorCode.ProcessStartFailed => "Не удалось запустить процесс Ghostscript. Проверьте права доступа и антивирусные ограничения.",
+                GhostscriptErrorCode.Timeout => "Ghostscript превысил лимит времени. Возможно, PDF повреждён или слишком тяжёлый.",
+                GhostscriptErrorCode.NonZeroExitCode => "Ghostscript завершился с ошибкой. Проверьте входной PDF и параметры профиля.",
+                GhostscriptErrorCode.OutputFileMissing => "Ghostscript завершился, но выходной файл не создан.",
+                GhostscriptErrorCode.Cancelled => "Операция отменена пользователем.",
+                _ => "Неизвестная ошибка при запуске Ghostscript."
             };
 
-            foreach (string root in roots)
-            {
-                if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root)) continue;
-
-                string[] candidates = Directory.GetFiles(root, "gswin64c.exe", SearchOption.AllDirectories)
-                    .Concat(Directory.GetFiles(root, "gswin32c.exe", SearchOption.AllDirectories))
-                    .OrderByDescending(f => f)
-                    .ToArray();
-
-                if (candidates.Length > 0) return candidates[0];
-            }
-
-            return string.Empty;
-        }
-
-        private string BuildGhostscriptArguments(string arguments)
-        {
-            return $"-dSAFER -dNOPROMPT -dQUIET {arguments}";
-        }
-
-        private bool RunGhostscriptWithRetry(string gsPath, string arguments, out string errorMsg)
-        {
-            errorMsg = string.Empty;
-            for (int attempt = 1; attempt <= GhostscriptRetryCount; attempt++)
-            {
-                if (RunGhostscript(gsPath, arguments, out string currentError)) return true;
-
-                errorMsg = currentError;
-                if (attempt < GhostscriptRetryCount)
-                {
-                    Thread.Sleep(GhostscriptRetryDelayMs);
-                }
-            }
-
-            return false;
-        }
-
-        // ОСТАВЛЯЕМ МЕТОД ЗАПУСКА БЕЗ ИЗМЕНЕНИЙ
-        private bool RunGhostscript(string gsPath, string arguments, out string errorMsg)
-        {
-            errorMsg = "";
-            ProcessStartInfo psi = new ProcessStartInfo
-            {
-                FileName = gsPath,
-                Arguments = BuildGhostscriptArguments(arguments),
-                CreateNoWindow = true,
-                UseShellExecute = false,
-                RedirectStandardError = true,
-                RedirectStandardOutput = true
-            };
-
-            using (Process p = new Process { StartInfo = psi })
-            {
-                StringBuilder output = new StringBuilder();
-                StringBuilder error = new StringBuilder();
-
-                p.OutputDataReceived += (_, e) => { if (e.Data != null) output.AppendLine(e.Data); };
-                p.ErrorDataReceived += (_, e) => { if (e.Data != null) error.AppendLine(e.Data); };
-
-                p.Start();
-                p.BeginOutputReadLine();
-                p.BeginErrorReadLine();
-
-                if (!p.WaitForExit((int)ghostscriptTimeout.TotalMilliseconds))
-                {
-                    try { p.Kill(true); } catch { }
-                    errorMsg = $"Ghostscript timeout after {ghostscriptTimeout.TotalMinutes:0} min.";
-                    return false;
-                }
-
-                p.WaitForExit();
-
-                if (p.ExitCode != 0)
-                {
-                    errorMsg = $"ExitCode: {p.ExitCode}\nStdErr: {error}\nStdOut: {output}";
-                    try { Clipboard.SetText($"CMD: \"{gsPath}\" {psi.Arguments}\n\nERR: {errorMsg}"); } catch { }
-                    return false;
-                }
-                return true;
-            }
+            return $"{title}\nКод: {result.ErrorCode}\n{friendlyText}\nТех. сообщение: {result.Message}\nСмотрите лог в папке logs.";
         }
 
         // --- ОСТАЛЬНЫЕ МЕТОДЫ СПИСКА (без изменений) ---
